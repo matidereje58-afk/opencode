@@ -1,0 +1,14 @@
+{
+  "name": "@opencode/cli",
+  "version": "2.3.0",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "opencode": "./bin/opencode.cjs",
+    "opencode2": "./bin/opencode2.cjs"
+  },
+  "scripts": {
+    "dev": "bun run src/index.ts"
+  },
+  "license": "MIT"
+}

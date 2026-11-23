@@ -1,0 +1,16 @@
+{
+  "name": "opencode",
+  "description": "AI-powered development tool",
+  "version": "2.3.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "scripts": {
+    "dev": "bun run --cwd packages/cli src/index.ts",
+    "dev:web": "bun --cwd packages/app dev"
+  },
+  "workspaces": {
+    "packages": ["packages/*", "packages/plugins/*", "services/*", "packages/data/*"]
+  },
+  "license": "MIT"
+}
