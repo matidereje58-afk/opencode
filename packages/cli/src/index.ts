@@ -1,0 +1,168 @@
+#!/usr/bin/env bun
+
+import { ensurePluginRuntime } from "@opencode/plugin/runtime"
+import { NodeRuntime, NodeServices } from "@effect/platform-node"
+import { Cause, Effect } from "effect"
+import { defaultTeardown, getErrorReported } from "effect/Runtime"
+import { Commands } from "./commands/commands"
+import { Runtime } from "./framework/runtime"
+import { Observability } from "@opencode/util/observability"
+import { Updater } from "./services/updater"
+import { OPENCODE_ARTIFACT, OPENCODE_CHANNEL, OPENCODE_LOCAL, OPENCODE_VERSION } from "./version"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { Global } from "@opencode/util/global"
+import { AppProcess } from "@opencode/util/process"
+import { Config } from "./config"
+import { Npm } from "@opencode/util/npm"
+import { EffectFlock } from "@opencode/util/effect-flock"
+import { Heap } from "./heap"
+import { CpuProfile } from "./cpu-profile"
+import { ShutdownDeadline } from "./shutdown-deadline"
+
+const noProxy = [
+  ...new Set(
+    [process.env.NO_PROXY, process.env.no_proxy, "127.0.0.1,localhost,::1"].flatMap((value) =>
+      (value ?? "").split(",").flatMap((entry) => entry.trim() || []),
+    ),
+  ),
+].join(",")
+
+process.env.NO_PROXY = noProxy
+process.env.no_proxy = noProxy
+
+ensurePluginRuntime()
+
+if (process.env.OPENCODE_SSH_ASKPASS_PORT) {
+  const { askpass } = await import("./ssh-askpass")
+  process.exit(await Effect.runPromise(askpass.pipe(Effect.provide(NodeServices.layer))))
+}
+
+let terminated = false
+
+const args = process.argv.slice(2)
+const set = args.findIndex((arg, index) => arg === "service" && args[index + 1] === "set")
+const kept = set === -1 ? args.length : set + (args[set + 2] === "env" ? 4 : 3)
+const loggedArgs = args.map((arg, index) => (index < kept ? arg : "<redacted>"))
+
+const Handlers = Runtime.handlers(Commands, {
+  $: () => import("./commands/handlers/default"),
+  upgrade: () => import("./commands/handlers/upgrade"),
+  uninstall: () => import("./commands/handlers/uninstall"),
+  acp: () => import("./commands/handlers/acp"),
+  api: () => import("./commands/handlers/api"),
+  auth: {
+    list: () => import("./commands/handlers/auth/list"),
+    login: () => import("./commands/handlers/auth/login"),
+    logout: () => import("./commands/handlers/auth/logout"),
+    export: () => import("./commands/handlers/auth/export"),
+    import: () => import("./commands/handlers/auth/import"),
+    switch: () => import("./commands/handlers/auth/switch"),
+  },
+  login: () => import("./commands/handlers/auth/login"),
+  debug: {
+    agents: () => import("./commands/handlers/debug/agents"),
+    config: () => import("./commands/handlers/debug/config"),
+    "heap-dump": () => import("./commands/handlers/debug/heap-dump"),
+    paths: () => import("./commands/handlers/debug/paths"),
+  },
+  mcp: {
+    list: () => import("./commands/handlers/mcp/list"),
+    add: () => import("./commands/handlers/mcp/add"),
+    auth: () => import("./commands/handlers/mcp/auth"),
+    logout: () => import("./commands/handlers/mcp/logout"),
+  },
+  plugin: {
+    list: () => import("./commands/handlers/plugin/list"),
+    add: () => import("./commands/handlers/plugin/add"),
+    remove: () => import("./commands/handlers/plugin/remove"),
+  },
+  models: () => import("./commands/handlers/models"),
+  stats: () => import("./commands/handlers/stats"),
+  mini: () => import("./commands/handlers/mini"),
+  run: () => import("./commands/handlers/run"),
+  session: {
+    list: () => import("./commands/handlers/session/list"),
+    get: () => import("./commands/handlers/session/get"),
+    set: () => import("./commands/handlers/session/set"),
+    unset: () => import("./commands/handlers/session/unset"),
+  },
+  serve: () => import("./commands/handlers/serve"),
+})
+
+Effect.gen(function* () {
+  yield* Heap.listen
+  yield* CpuProfile.listen
+  yield* ShutdownDeadline.install()
+  process.once("SIGTERM", () => {
+    terminated = true
+  })
+  const runFork = Effect.runForkWith(yield* Effect.context<never>())
+  const uncaughtException = (cause: Error, origin: "uncaughtException" | "unhandledRejection") => {
+    runFork(Effect.logError("uncaught exception", { cause, origin }))
+  }
+  const unhandledRejection = (cause: unknown) => {
+    runFork(Effect.logError("unhandled rejection", { cause }))
+  }
+  process.on("uncaughtException", uncaughtException)
+  process.on("unhandledRejection", unhandledRejection)
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      process.off("uncaughtException", uncaughtException)
+      process.off("unhandledRejection", unhandledRejection)
+    }),
+  )
+  yield* Effect.logInfo("cli starting", {
+    version: OPENCODE_VERSION,
+    channel: OPENCODE_CHANNEL,
+    local: OPENCODE_LOCAL,
+    args: loggedArgs,
+  })
+  return yield* Runtime.run(Commands, Handlers, { version: OPENCODE_VERSION })
+}).pipe(
+  Effect.catchCause((cause) =>
+    Effect.logError("cli process failed", {
+      cause,
+      args: loggedArgs,
+    }).pipe(Effect.andThen(Effect.failCause(cause))),
+  ),
+  Effect.annotateLogs({ role: "cli" }),
+  Effect.provide(Config.layer),
+  Effect.provide(Updater.layer),
+  Effect.provide(
+    LayerNode.compile(LayerNode.group([Global.node, AppProcess.node, Npm.node, EffectFlock.node]), {
+      replacements: [
+        Global.node.replace(
+          Global.layerWith(process.env.OPENCODE_CONFIG_DIR ? { config: process.env.OPENCODE_CONFIG_DIR } : {}),
+        ),
+      ],
+    }),
+  ),
+  Effect.provide(
+    Observability.layer({
+      endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+      headers: process.env.OTEL_EXPORTER_OTLP_HEADERS,
+      client: process.env.OPENCODE_CLIENT ?? OPENCODE_ARTIFACT,
+      version: OPENCODE_VERSION,
+      channel: OPENCODE_CHANNEL,
+    }),
+  ),
+  Effect.provide(NodeServices.layer),
+  Effect.scoped,
+  Effect.tapCause((cause) =>
+    Effect.sync(() => {
+      if (Cause.hasInterruptsOnly(cause)) return
+      if (!getErrorReported(Cause.squash(cause))) return
+      process.stderr.write(Cause.pretty(cause) + "\n")
+    }),
+  ),
+  NodeRuntime.runMain({
+    disableErrorReporting: true,
+    teardown: (exit) =>
+      defaultTeardown(exit, (code) => {
+        const status = code === 0 ? (process.exitCode ?? 0) : code === 130 && terminated ? 143 : code
+        void Promise.all(
+          [process.stdout, process.stderr].map((stream) => new Promise<void>((resolve) => stream.end(() => resolve()))),
+        ).then(() => process.exit(status))
+      }),
+  }),
+)
